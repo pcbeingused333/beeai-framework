@@ -96,7 +96,7 @@ class OpenAPITool(Tool[BaseModel, ToolRunOptions, OpenAPIToolOutput]):
         base_parsed = urlparse(base_url)
         joined_path = f"{base_parsed.path.rstrip('/')}/{path_parsed.path.lstrip('/')}" if path else base_parsed.path
         query = "&".join(q for q in (base_parsed.query, path_parsed.query) if q)
-        resolved = urlunparse(base_parsed._replace(path=joined_path, query=query, fragment=""))
+        resolved = base_parsed._replace(path=joined_path, query=query, fragment="").geturl()
         resolved_parsed = urlparse(resolved)
 
         if resolved_parsed.netloc != base_parsed.netloc or resolved_parsed.scheme != base_parsed.scheme:
@@ -112,6 +112,9 @@ class OpenAPITool(Tool[BaseModel, ToolRunOptions, OpenAPIToolOutput]):
         # Python's str(True) is "True"; OpenAPI (and JSON) booleans are lowercase.
         if isinstance(value, bool):
             return "true" if value else "false"
+        if isinstance(value, list):
+            # OpenAPI's default "simple" style for path, header and cookie arrays.
+            return ",".join(OpenAPITool._serialize_value(item) for item in value)
         return str(value)
 
     def _parameter_locations(self, path: str, method: str) -> dict[str, str]:
@@ -287,11 +290,21 @@ class OpenAPITool(Tool[BaseModel, ToolRunOptions, OpenAPIToolOutput]):
             # A parameter the spec does not describe goes to the path if it has a `{name}` slot, else to the query.
             location = locations.get(name) or ("path" if f"{{{name}}}" in raw_path else "query")
             if location == "path":
-                path = path.replace(f"{{{name}}}", quote(self._serialize_value(value), safe=""))
+                serialized = self._serialize_value(value)
+                # Dot segments would be normalized away and step outside the server's base path.
+                if serialized in (".", ".."):
+                    raise ToolError(f"Invalid value for path parameter '{name}': {serialized}")
+                path = path.replace(f"{{{name}}}", quote(serialized, safe=""))
             elif location == "header":
-                request_headers[name] = self._serialize_value(value)
+                # OpenAPI ignores header parameters with these names; they come from the tool's configuration.
+                if name.lower() in ("accept", "content-type", "authorization"):
+                    continue
+                serialized = self._serialize_value(value)
+                if any(ord(char) < 32 or ord(char) == 127 for char in serialized):
+                    raise ToolError(f"Invalid value for header parameter '{name}'.")
+                request_headers[name] = serialized
             elif location == "cookie":
-                cookies.append(f"{name}={self._serialize_value(value)}")
+                cookies.append(f"{name}={quote(self._serialize_value(value), safe='')}")
             else:
                 values = value if isinstance(value, list) else [value]
                 query_params[name] = [self._serialize_value(v) for v in values]
@@ -308,10 +321,17 @@ class OpenAPITool(Tool[BaseModel, ToolRunOptions, OpenAPIToolOutput]):
 
         body = input_dict.get("body")
         # The input schema prefers an application/json request body, so send it as JSON, not form-encoded.
-        request_body = self.open_api_schema.get("paths", {}).get(raw_path, {}).get(method, {}).get("requestBody", {})
+        path_spec = self.open_api_schema.get("paths", {}).get(raw_path, {})
+        request_body = (path_spec.get(method) or path_spec.get(method.lower()) or {}).get("requestBody", {})
         send_json = "application/json" in request_body.get("content", {})
 
-        headers = {"Accept": "application/json", **self.headers, **request_headers}
+        # Configured headers win over the model's header parameters, compared case-insensitively.
+        configured = {name.lower() for name in self.headers}
+        headers = {
+            "Accept": "application/json",
+            **{name: value for name, value in request_headers.items() if name.lower() not in configured},
+            **self.headers,
+        }
         if cookies:
             existing = next((k for k in headers if k.lower() == "cookie"), None)
             headers[existing or "Cookie"] = "; ".join(([headers[existing]] if existing else []) + cookies)

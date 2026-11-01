@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
+from beeai_framework.tools import ToolError
 from beeai_framework.tools.openapi import OpenAPITool
 
 YAML_SPEC = """
@@ -166,7 +167,7 @@ def _schema(server_url: str, path: str, method_spec: dict) -> dict:
 
 
 async def _run_and_capture(
-    monkeypatch: pytest.MonkeyPatch, schema: dict, parameters: dict
+    monkeypatch: pytest.MonkeyPatch, schema: dict, parameters: dict, headers: dict[str, str] | None = None
 ) -> tuple[str, dict[str, str]]:
     captured: dict[str, object] = {}
 
@@ -178,6 +179,7 @@ async def _run_and_capture(
     monkeypatch.setattr(httpx.AsyncClient, "request", fake_request)
 
     [tool] = OpenAPITool.from_schema(schema)
+    tool.headers = headers or {}
     await tool.run({"parameters": parameters})
     return str(captured["url"]), dict(captured["headers"])  # type: ignore[call-overload]
 
@@ -252,3 +254,100 @@ async def test_server_url_path_and_query_are_kept(monkeypatch: pytest.MonkeyPatc
     url, _ = await _run_and_capture(monkeypatch, schema, {"petId": 1, "verbose": True})
 
     assert url == "https://example.invalid/api/pets/1?key=k&verbose=true"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [".", ".."])
+async def test_dot_segment_path_parameters_are_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    schema = _schema(
+        "https://example.invalid/v1",
+        "/pets/{petId}",
+        {"parameters": [{"name": "petId", "in": "path", "required": True, "schema": {"type": "string"}}]},
+    )
+
+    # httpx would normalize "/v1/pets/.." to "/v1", outside the operation's path.
+    with pytest.raises(ToolError):
+        await _run_and_capture(monkeypatch, schema, {"petId": value})
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_configured_headers_win_over_header_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = _schema(
+        "https://example.invalid",
+        "/pets",
+        {
+            "parameters": [
+                {"name": "Authorization", "in": "header", "schema": {"type": "string"}},
+                {"name": "x-tenant", "in": "header", "schema": {"type": "string"}},
+                {"name": "X-Trace", "in": "header", "schema": {"type": "string"}},
+            ]
+        },
+    )
+
+    _, headers = await _run_and_capture(
+        monkeypatch,
+        schema,
+        {"Authorization": "Bearer attacker", "x-tenant": "other", "X-Trace": "t1"},
+        headers={"Authorization": "Bearer secret", "X-Tenant": "mine"},
+    )
+
+    assert headers == {
+        "Accept": "application/json",
+        "X-Trace": "t1",
+        "Authorization": "Bearer secret",
+        "X-Tenant": "mine",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_header_parameter_with_line_break_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = _schema(
+        "https://example.invalid",
+        "/pets",
+        {"parameters": [{"name": "X-Request-Id", "in": "header", "schema": {"type": "string"}}]},
+    )
+
+    with pytest.raises(ToolError):
+        await _run_and_capture(monkeypatch, schema, {"X-Request-Id": "a\r\nX-Evil: 1"})
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cookie_values_are_encoded(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = _schema(
+        "https://example.invalid",
+        "/pets",
+        {"parameters": [{"name": "session", "in": "cookie", "schema": {"type": "string"}}]},
+    )
+
+    _, headers = await _run_and_capture(monkeypatch, schema, {"session": "s1; admin=true"})
+
+    assert headers["Cookie"] == "session=s1%3B%20admin%3Dtrue"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_array_path_and_header_parameters_use_simple_style(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = _schema(
+        "https://example.invalid",
+        "/pets/{ids}",
+        {
+            "parameters": [
+                {
+                    "name": "ids",
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "array", "items": {"type": "integer"}},
+                },
+                {"name": "X-Tags", "in": "header", "schema": {"type": "array", "items": {"type": "string"}}},
+            ]
+        },
+    )
+
+    url, headers = await _run_and_capture(monkeypatch, schema, {"ids": [1, 2], "X-Tags": ["a", "b"]})
+
+    assert url == "https://example.invalid/pets/1%2C2"
+    assert headers["X-Tags"] == "a,b"
